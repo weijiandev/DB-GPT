@@ -30,6 +30,7 @@ from dbgpt.agent.util.llm.llm import LLMStrategyType
 from dbgpt.component import BaseComponent, ComponentType, SystemApp
 from dbgpt.core import PromptTemplate
 from dbgpt.core.awel.flow.flow_factory import FlowCategory
+from dbgpt.core.awel.util.chat_util import parse_sse_data
 from dbgpt.core.interface.message import StorageConversation
 from dbgpt.model.cluster import WorkerManagerFactory
 from dbgpt.model.cluster.client import DefaultLLMClient
@@ -306,7 +307,7 @@ class MultiAgents(BaseComponent, ABC):
             async for chunk in flow_service.chat_stream_flow_str(
                 team_context.uid, flow_req
             ):
-                yield None, chunk, agent_conv_id
+                yield None, _wrap_openai_sse_to_vis(chunk), agent_conv_id
         else:
             # init gpts  memory
             self.memory.init(
@@ -469,8 +470,15 @@ class MultiAgents(BaseComponent, ABC):
                 if final_message:
                     current_message.add_view_message(final_message)
             else:
-                default_final_message = default_final_message.replace("data:", "")
-                current_message.add_view_message(default_final_message)
+                default_final_message = default_final_message.replace("data:", "").strip()
+                try:
+                    payload = json.loads(default_final_message)
+                except Exception:
+                    payload = None
+                if isinstance(payload, dict) and "vis" in payload:
+                    current_message.add_view_message(payload["vis"])
+                else:
+                    current_message.add_view_message(default_final_message)
 
             current_message.end_current_round()
             current_message.save_to_storage()
@@ -704,6 +712,33 @@ class MultiAgents(BaseComponent, ABC):
 def _format_vis_msg(msg: str):
     content = json.dumps({"vis": msg}, default=serialize, ensure_ascii=False)
     return f"data:{content} \n\n"
+
+
+def _wrap_openai_sse_to_vis(msg: str) -> str:
+    data = parse_sse_data(msg) if isinstance(msg, str) else None
+    if not data:
+        return _format_vis_msg(str(msg))
+    data = data.strip()
+    if data == "[DONE]":
+        return _format_vis_msg("[DONE]")
+    try:
+        payload = json.loads(data)
+    except Exception:
+        return _format_vis_msg(data.replace("\\n", "\n"))
+    text = None
+    choices = payload.get("choices") or []
+    if choices:
+        choice = choices[0] or {}
+        delta = choice.get("delta") or {}
+        message = choice.get("message") or {}
+        text = delta.get("content") or message.get("content")
+    if text is None:
+        text = payload.get("text")
+    if text is None:
+        text = data
+    if isinstance(text, str):
+        text = text.replace("\\n", "\n")
+    return _format_vis_msg(text)
 
 
 multi_agents = MultiAgents(system_app)
